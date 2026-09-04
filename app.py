@@ -926,6 +926,73 @@ def get_customers():
     return jsonify(result)
 
 
+@app.route("/customers/<int:customer_id>", methods=["GET"])
+@jwt_required()
+def get_customer_detail(customer_id):
+    """
+    SAP B1's Business Partner Master shows a "Relationship Map" of
+    every document tied to that customer. This gives the dedicated
+    Customer detail page the same idea: profile + masters, plus
+    every sales order, invoice, and payment linked to them, each
+    already carrying enough info to link straight to its own detail
+    page.
+    """
+
+    cur = mysql.connection.cursor(DictCursor)
+
+    try:
+        cur.execute("""
+            SELECT
+                c.id, c.customer_code, c.customer_name, c.phone, c.email,
+                c.location, c.route, c.credit_limit, c.status, c.created_by,
+                c.created_at, c.price_list_id, pl.name AS price_list_name,
+                c.payment_terms_id, pt.name AS payment_terms_name
+            FROM customers c
+            LEFT JOIN price_lists pl ON pl.id = c.price_list_id
+            LEFT JOIN payment_terms pt ON pt.id = c.payment_terms_id
+            WHERE c.id = %s
+        """, (customer_id,))
+
+        customer = cur.fetchone()
+
+        if not customer:
+            return jsonify({"message": "Customer not found"}), 404
+
+        cur.execute("""
+            SELECT id, order_number, order_date, total_amount, status, doc_status
+            FROM sales_orders
+            WHERE customer_id = %s
+            ORDER BY order_date DESC
+        """, (customer_id,))
+        customer["sales_orders"] = cur.fetchall()
+
+        # invoices link to a customer only via customer_name (no FK —
+        # see the schema note elsewhere in this file), so match on
+        # that rather than an id join.
+        cur.execute("""
+            SELECT id, invoice_number, invoice_amount, due_date, status, doc_status
+            FROM invoices
+            WHERE customer_name = %s
+            ORDER BY created_at DESC
+        """, (customer["customer_name"],))
+        customer["invoices"] = cur.fetchall()
+
+        cur.execute("""
+            SELECT p.id, p.payment_reference, p.amount_paid, p.payment_method,
+                   p.payment_date, p.status, i.invoice_number
+            FROM payments p
+            LEFT JOIN invoices i ON i.id = p.invoice_id
+            WHERE i.customer_name = %s
+            ORDER BY p.payment_date DESC
+        """, (customer["customer_name"],))
+        customer["payments"] = cur.fetchall()
+
+    finally:
+        cur.close()
+
+    return jsonify(customer)
+
+
 @app.route("/customers/export", methods=["GET"])
 @jwt_required()
 def export_customers():
@@ -1956,6 +2023,101 @@ def get_invoices():
     return jsonify(rows)
 
 
+@app.route("/admin/invoices/<int:invoice_id>", methods=["GET"])
+@jwt_required()
+def get_invoice_detail(invoice_id):
+    """
+    Full invoice detail for the dedicated view page — mirrors
+    get_sales_order_detail's shape: the invoice itself, its base
+    sales order (if any) with line items so the invoice shows what
+    was actually sold, whatever closed IT (a delivery, if one was
+    copied from this invoice), and every payment made against it so
+    the page can show a running balance instead of just "Pending".
+    """
+
+    cur = mysql.connection.cursor(DictCursor)
+
+    try:
+        cur.execute("""
+            SELECT
+                i.id,
+                i.invoice_number,
+                i.customer_name,
+                i.sales_order_id,
+                i.invoice_amount,
+                i.due_date,
+                i.status,
+                i.doc_status,
+                i.closed_by_type,
+                i.closed_by_id,
+                i.created_at
+            FROM invoices i
+            WHERE i.id = %s
+        """, (invoice_id,))
+
+        invoice = cur.fetchone()
+
+        if not invoice:
+            return jsonify({"message": "Invoice not found"}), 404
+
+        # Base sales order (if this invoice was copied from one).
+        base_order = None
+        if invoice["sales_order_id"]:
+            cur.execute("""
+                SELECT
+                    so.id, so.order_number, so.order_date, so.status AS order_status,
+                    c.customer_code
+                FROM sales_orders so
+                LEFT JOIN customers c ON c.id = so.customer_id
+                WHERE so.id = %s
+            """, (invoice["sales_order_id"],))
+            base_order = cur.fetchone()
+
+            cur.execute("""
+                SELECT item_id, item_code, item_name, quantity, unit, unit_price, discount, total
+                FROM order_items
+                WHERE sales_order_id = %s
+                ORDER BY id ASC
+            """, (invoice["sales_order_id"],))
+            invoice["items"] = cur.fetchall()
+        else:
+            invoice["items"] = []
+
+        invoice["base_order"] = base_order
+
+        # Whatever closed this invoice (a delivery copied from it).
+        closed_by_number = None
+        if invoice["closed_by_type"] == "delivery" and invoice["closed_by_id"]:
+            cur.execute(
+                "SELECT dispatch_code FROM deliveries WHERE id = %s",
+                (invoice["closed_by_id"],)
+            )
+            row = cur.fetchone()
+            closed_by_number = row["dispatch_code"] if row else None
+        invoice["closed_by_number"] = closed_by_number
+
+        # Payment history + running balance — this is what makes
+        # "why does it say Pending" make sense: Pending/Partial/Paid
+        # reflects this list, not a guess.
+        cur.execute("""
+            SELECT id, payment_reference, amount_paid, payment_method, payment_date, status
+            FROM payments
+            WHERE invoice_id = %s
+            ORDER BY payment_date ASC, id ASC
+        """, (invoice_id,))
+        payments = cur.fetchall()
+
+        total_paid = sum(float(p["amount_paid"] or 0) for p in payments if p["status"] != "Cancelled")
+        invoice["payments"] = payments
+        invoice["total_paid"] = round(total_paid, 2)
+        invoice["balance_remaining"] = round(float(invoice["invoice_amount"] or 0) - total_paid, 2)
+
+    finally:
+        cur.close()
+
+    return jsonify(invoice)
+
+
 @app.route("/create-invoice", methods=["POST"])
 @jwt_required()
 def create_invoice():
@@ -2467,6 +2629,7 @@ def get_delivery_detail(delivery_id):
                 item_code,
                 item_name,
                 quantity,
+                returned_quantity,
                 unit
             FROM delivery_items
             WHERE delivery_id = %s
@@ -2746,6 +2909,19 @@ def create_delivery():
                 line["unit"]
             ))
 
+            # SAP B1-style Goods Issue: posting a delivery deducts the
+            # delivered quantity from stock immediately. Allowed to go
+            # negative rather than blocking the delivery outright (SAP
+            # B1's default behaviour too, with a warning) — but we
+            # surface that as a warning in the response so the UI can
+            # flag it rather than silently going negative unnoticed.
+            if line["item_id"]:
+                cur.execute("""
+                    UPDATE items
+                    SET stock = stock - %s
+                    WHERE id = %s
+                """, (line["quantity"], line["item_id"]))
+
         # Close every referenced sales order / invoice, same as
         # create_invoice does — a document can only be "copied to"
         # a delivery once. Delete this delivery later and these all
@@ -2762,6 +2938,24 @@ def create_delivery():
 
         mysql.connection.commit()
 
+        # Check for any items that went negative, so the UI can warn
+        # about it (delivery is still valid/posted — SAP B1 allows
+        # negative stock by default too).
+        low_stock_warnings = []
+        if pick_list:
+            item_ids = [line["item_id"] for line in pick_list if line["item_id"]]
+            if item_ids:
+                placeholders = ",".join(["%s"] * len(item_ids))
+                cur.execute(f"""
+                    SELECT item_code, name, stock
+                    FROM items
+                    WHERE id IN ({placeholders}) AND stock < 0
+                """, item_ids)
+                low_stock_warnings = [
+                    {"item_code": r[0], "name": r[1], "stock": float(r[2])}
+                    for r in cur.fetchall()
+                ]
+
         create_system_log(
             action="DELIVERY_CREATED",
             status="SUCCESS",
@@ -2770,7 +2964,8 @@ def create_delivery():
                 "dispatch_code": dispatch_code,
                 "reference_count": len(resolved_refs),
                 "item_count": len(pick_list),
-                "created_by": current_user["username"]
+                "created_by": current_user["username"],
+                "negative_stock_items": low_stock_warnings
             },
             response={"message": "Delivery created"}
         )
@@ -2780,7 +2975,8 @@ def create_delivery():
             "id": delivery_id,
             "dispatch_code": dispatch_code,
             "reference_count": len(resolved_refs),
-            "item_count": len(pick_list)
+            "item_count": len(pick_list),
+            "negative_stock_items": low_stock_warnings
         }), 201
 
     except Exception as e:
@@ -2804,13 +3000,44 @@ def update_delivery(delivery_id):
     and — now that the delivery already exists — the return fields).
     References and the pick list are intentionally not editable here;
     create a new delivery if it was linked to the wrong order(s).
+
+    SAP B1-style Goods Return: setting return_status restores stock.
+      - "Returned" (full return), no return_items given: restores the
+        full remaining (not-yet-returned) quantity of every line on
+        this delivery. Guarded by return_processed so re-saving the
+        form without changing anything doesn't restore stock twice.
+      - "Partially Returned" WITH a return_items list in the body
+        ([{ "item_id": 5, "quantity": 2 }, ...]): restores exactly
+        those quantities, capped at what's still returnable on that
+        line, and can be called again later for a further partial
+        return on the same delivery (each call only restores the new
+        delta, tracked via delivery_items.returned_quantity).
+      - "Partially Returned" with NO return_items: status/reason are
+        saved but no stock is touched — there's nothing to go on for
+        which items or how much.
     """
 
     data = request.get_json() or {}
 
+    new_return_status = data.get("return_status", "No Return")
+    return_items = data.get("return_items")  # optional list
+
     cur = mysql.connection.cursor()
 
     try:
+        cur.execute("""
+            SELECT return_status, return_processed
+            FROM deliveries
+            WHERE id = %s
+        """, (delivery_id,))
+
+        existing = cur.fetchone()
+
+        if not existing:
+            return jsonify({"message": "Delivery not found"}), 404
+
+        previous_return_status, return_processed = existing
+
         cur.execute("""
             UPDATE deliveries
             SET
@@ -2824,18 +3051,100 @@ def update_delivery(delivery_id):
             data.get("driver_id"),
             data.get("delivery_date"),
             data.get("status", "Not Started"),
-            data.get("return_status", "No Return"),
+            new_return_status,
             data.get("return_reason"),
             delivery_id
         ))
 
-        if cur.rowcount == 0:
-            mysql.connection.rollback()
-            return jsonify({"message": "Delivery not found"}), 404
+        restored_items = []
+
+        # ---- Full return: restore everything not yet returned ----
+        if new_return_status == "Returned" and not return_items and not return_processed:
+
+            cur.execute("""
+                SELECT id, item_id, item_code, item_name, quantity, returned_quantity
+                FROM delivery_items
+                WHERE delivery_id = %s
+            """, (delivery_id,))
+
+            for line_id, item_id, item_code, item_name, qty, already_returned in cur.fetchall():
+                remaining = float(qty) - float(already_returned or 0)
+
+                if remaining > 0 and item_id:
+                    cur.execute("""
+                        UPDATE items SET stock = stock + %s WHERE id = %s
+                    """, (remaining, item_id))
+
+                    cur.execute("""
+                        UPDATE delivery_items SET returned_quantity = %s WHERE id = %s
+                    """, (qty, line_id))
+
+                    restored_items.append({
+                        "item_code": item_code, "item_name": item_name, "quantity": remaining
+                    })
+
+            cur.execute("""
+                UPDATE deliveries SET return_processed = 1 WHERE id = %s
+            """, (delivery_id,))
+
+        # ---- Partial return: restore only the specified lines/qty ----
+        elif new_return_status == "Partially Returned" and return_items:
+
+            for ri in return_items:
+                item_id = ri.get("item_id")
+                requested_qty = float(ri.get("quantity") or 0)
+
+                if not item_id or requested_qty <= 0:
+                    continue
+
+                cur.execute("""
+                    SELECT id, item_code, item_name, quantity, returned_quantity
+                    FROM delivery_items
+                    WHERE delivery_id = %s AND item_id = %s
+                """, (delivery_id, item_id))
+
+                row = cur.fetchone()
+                if not row:
+                    continue
+
+                line_id, item_code, item_name, qty, already_returned = row
+                remaining = float(qty) - float(already_returned or 0)
+                actual_qty = min(requested_qty, remaining)
+
+                if actual_qty <= 0:
+                    continue
+
+                cur.execute("""
+                    UPDATE items SET stock = stock + %s WHERE id = %s
+                """, (actual_qty, item_id))
+
+                cur.execute("""
+                    UPDATE delivery_items
+                    SET returned_quantity = returned_quantity + %s
+                    WHERE id = %s
+                """, (actual_qty, line_id))
+
+                restored_items.append({
+                    "item_code": item_code, "item_name": item_name, "quantity": actual_qty
+                })
 
         mysql.connection.commit()
 
-        return jsonify({"message": "Delivery updated successfully"})
+        create_system_log(
+            action="DELIVERY_UPDATED",
+            status="SUCCESS",
+            payload={
+                "delivery_id": delivery_id,
+                "return_status": new_return_status,
+                "restored_items": restored_items
+            },
+            response={"message": "Delivery updated"}
+        )
+
+        return jsonify({
+            "message": "Delivery updated successfully",
+            "restored_items": restored_items
+        })
 
     except Exception as e:
 
@@ -2914,6 +3223,25 @@ def delete_delivery(delivery_id):
         """, (delivery_id,))
 
         refs = cur.fetchall()
+
+        # Same idea for stock: reverse the original Goods Issue before
+        # the row (and its delivery_items, which cascade-delete with
+        # it) is gone. Only restore the portion that's still "out" —
+        # i.e. NOT already put back via a prior return — so deleting a
+        # delivery that already had a full return doesn't double-add
+        # stock back.
+        cur.execute("""
+            SELECT item_id, quantity, returned_quantity
+            FROM delivery_items
+            WHERE delivery_id = %s
+        """, (delivery_id,))
+
+        for item_id, qty, already_returned in cur.fetchall():
+            still_out = float(qty) - float(already_returned or 0)
+            if item_id and still_out > 0:
+                cur.execute("""
+                    UPDATE items SET stock = stock + %s WHERE id = %s
+                """, (still_out, item_id))
 
         cur.execute("""
             DELETE FROM deliveries
@@ -3016,6 +3344,96 @@ def get_payments():
         cur.close()
 
     return jsonify(rows)
+
+
+@app.route("/admin/payments/<int:payment_id>", methods=["GET"])
+@jwt_required()
+def get_payment_detail(payment_id):
+    cur = mysql.connection.cursor(DictCursor)
+
+    try:
+        cur.execute("""
+            SELECT
+                p.id, p.payment_reference, p.invoice_id, p.amount_paid,
+                p.payment_method, p.payment_date, p.status, p.created_at,
+                i.invoice_number, i.customer_name, i.invoice_amount, i.status AS invoice_status
+            FROM payments p
+            LEFT JOIN invoices i ON i.id = p.invoice_id
+            WHERE p.id = %s
+        """, (payment_id,))
+
+        payment = cur.fetchone()
+
+        if not payment:
+            return jsonify({"message": "Payment not found"}), 404
+
+    finally:
+        cur.close()
+
+    return jsonify(payment)
+
+
+@app.route("/admin/payments/<int:payment_id>/cancel", methods=["PATCH"])
+@jwt_required()
+def cancel_payment(payment_id):
+    """
+    SAP B1-style void: marks the payment Cancelled and recomputes the
+    invoice's paid total / status without it, same idea as
+    cancel_invoice re-opening a sales order.
+    """
+
+    cur = mysql.connection.cursor()
+
+    try:
+        cur.execute("""
+            SELECT invoice_id, status FROM payments WHERE id = %s
+        """, (payment_id,))
+
+        row = cur.fetchone()
+        if not row:
+            return jsonify({"message": "Payment not found"}), 404
+
+        invoice_id, current_status = row
+
+        if current_status == "Cancelled":
+            return jsonify({"message": "Payment is already cancelled"}), 400
+
+        cur.execute("""
+            UPDATE payments SET status = 'Cancelled' WHERE id = %s
+        """, (payment_id,))
+
+        if invoice_id:
+            cur.execute("""
+                SELECT invoice_amount FROM invoices WHERE id = %s
+            """, (invoice_id,))
+            inv_row = cur.fetchone()
+            invoice_amount = float(inv_row[0] or 0) if inv_row else 0
+
+            cur.execute("""
+                SELECT COALESCE(SUM(amount_paid), 0)
+                FROM payments
+                WHERE invoice_id = %s AND status != 'Cancelled'
+            """, (invoice_id,))
+            total_paid = float(cur.fetchone()[0] or 0)
+
+            new_status = "Paid" if total_paid >= invoice_amount - 0.01 and invoice_amount > 0 else (
+                "Partial" if total_paid > 0 else "Pending"
+            )
+
+            cur.execute("""
+                UPDATE invoices SET status = %s WHERE id = %s
+            """, (new_status, invoice_id))
+
+        mysql.connection.commit()
+
+        return jsonify({"message": "Payment cancelled and invoice status recalculated"})
+
+    except Exception as e:
+        mysql.connection.rollback()
+        return jsonify({"message": "Failed to cancel payment", "error": str(e)}), 500
+
+    finally:
+        cur.close()
 
 
 @app.route("/create-payment", methods=["POST"])
